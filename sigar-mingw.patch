@@ -1,0 +1,244 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 83548d1..d9f80eb 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -4,6 +4,29 @@ MESSAGE(STATUS "CMAKE_SYSTEM_NAME is ${CMAKE_SYSTEM_NAME}")
+ 
+ INCLUDE_DIRECTORIES(../include/)
+ 
++INCLUDE(CheckCSourceCompiles)
++
++MACRO (CHECK_STRUCT_MEMBER _STRUCT _MEMBER _HEADER _RESULT)
++   SET(_INCLUDE_FILES)
++   FOREACH (it ${_HEADER})
++      SET(_INCLUDE_FILES "${_INCLUDE_FILES}#include <${it}>\n")
++   ENDFOREACH (it)
++
++   SET(_CHECK_STRUCT_MEMBER_SOURCE_CODE "
++${_INCLUDE_FILES}
++int main()
++{
++   static ${_STRUCT} tmp;
++   if (sizeof(tmp.${_MEMBER}))
++      return 0;
++  return 0;
++}
++")
++   CHECK_C_SOURCE_COMPILES("${_CHECK_STRUCT_MEMBER_SOURCE_CODE}" ${_RESULT})
++
++ENDMACRO (CHECK_STRUCT_MEMBER)
++
++
+ ## linux
+ IF(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+   SET(SIGAR_SRC os/linux/linux_sigar.c)
+@@ -60,6 +83,8 @@ IF(WIN32)
+   ADD_DEFINITIONS(-DSIGAR_SHARED)
+   SET(SIGAR_SRC os/win32/peb.c os/win32/win32_sigar.c)
+   INCLUDE_DIRECTORIES(os/win32)
++  CHECK_STRUCT_MEMBER(MIB_IPADDRROW wType "windows.h;iphlpapi.h" wType_in_MIB_IPADDRROW)
++  add_definitions(-DHAVE_MIB_IPADDRROW_WTYPE=${wType_in_MIB_IPADDRROW})
+ ENDIF(WIN32)
+ 
+ SET(SIGAR_SRC ${SIGAR_SRC}
+diff --git a/src/os/win32/sigar_os.h b/src/os/win32/sigar_os.h
+index ff2de7c..cd3c7e8 100755
+--- a/src/os/win32/sigar_os.h
++++ b/src/os/win32/sigar_os.h
+@@ -19,11 +19,15 @@
+ #ifndef SIGAR_OS_H
+ #define SIGAR_OS_H
+ 
++#ifdef MSVC
+ #if _MSC_VER <= 1200
+ #define SIGAR_USING_MSC6 /* Visual Studio version 6 */
+ #endif
++#else
++/* Cross compiling */
++#define _WIN32_WINNT 0x0501
++#endif
+ 
+-#define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+ #include <winreg.h>
+ #include <winperf.h>
+@@ -38,7 +42,22 @@
+ 
+ #include "sigar_util.h"
+ 
+-#define INT64_C(val) val##i64
++#ifdef MSVC
++#  define INT64_C(val) val##i64
++#  define SIGAR_DLLFUNC(api, name) \
++    struct { \
++         const char *name; \
++         ##api##_##name func; \
++    } ##name
++#else
++/* The GCC compiler doesn't require/accept the ## prefix */
++#  define INT64_C(val) val##L
++#  define SIGAR_DLLFUNC(api, name)		\
++    struct { \
++         const char *name; \
++         api##_##name func; \
++    } name
++#endif
+ 
+ /* see apr/include/arch/win32/atime.h */
+ #define EPOCH_DELTA INT64_C(11644473600000000)
+@@ -457,12 +476,6 @@ typedef BOOL (CALLBACK *mpr_get_net_connection)(LPCTSTR,
+                                                 LPTSTR,
+                                                 LPDWORD);
+ 
+-#define SIGAR_DLLFUNC(api, name) \
+-    struct { \
+-         const char *name; \
+-         ##api##_##name func; \
+-    } ##name
+-
+ typedef struct {
+     sigar_dll_handle_t handle;
+ 
+diff --git a/src/os/win32/win32_sigar.c b/src/os/win32/win32_sigar.c
+index b9a5669..74bf874 100755
+--- a/src/os/win32/win32_sigar.c
++++ b/src/os/win32/win32_sigar.c
+@@ -23,6 +23,7 @@
+ #include "sigar_util.h"
+ #include "sigar_format.h"
+ #include <shellapi.h>
++#include <iphlpapi.h>
+ 
+ #define USING_WIDE_S(s) (s)->using_wide
+ #define USING_WIDE()    USING_WIDE_S(sigar)
+@@ -124,6 +125,9 @@ typedef enum {
+ #define MS_LOOPBACK_ADAPTER "Microsoft Loopback Adapter"
+ #define NETIF_LA "la"
+ 
++static int get_proc_info(sigar_t *sigar, sigar_pid_t pid);
++static int netif_hash(char *s);
++
+ sigar_uint64_t sigar_FileTimeToTime(FILETIME *ft)
+ {
+     sigar_uint64_t time;
+@@ -374,6 +378,7 @@ static sigar_mpr_t sigar_mpr = {
+     { NULL, NULL }
+ };
+ 
++#ifdef MSVC
+ #define DLLMOD_COPY(name) \
+     memcpy(&(sigar->##name), &sigar_##name, sizeof(sigar_##name))
+ 
+@@ -382,6 +387,18 @@ static sigar_mpr_t sigar_mpr = {
+ 
+ #define DLLMOD_FREE(name) \
+     sigar_dllmod_free((sigar_dll_module_t *)&(sigar->##name))
++#else
++/* The GCC compiler doesn't require/accept the ## prefix */
++#define DLLMOD_COPY(name) \
++    memcpy(&(sigar->name), &sigar_##name, sizeof(sigar_##name))
++
++#define DLLMOD_INIT(name, all) \
++    sigar_dllmod_init(sigar, (sigar_dll_module_t *)&(sigar->name), all)
++
++#define DLLMOD_FREE(name) \
++    sigar_dllmod_free((sigar_dll_module_t *)&(sigar->name))
++#endif
++
+ 
+ static void sigar_dllmod_free(sigar_dll_module_t *module)
+ {
+@@ -1470,7 +1487,9 @@ static int sigar_remote_proc_args_get(sigar_t *sigar, sigar_pid_t pid,
+     }
+ 
+     /* likely we are 32-bit, pid process is 64-bit */
++#ifdef MSVC
+     status = sigar_proc_args_wmi_get(sigar, pid, procargs);
++#endif
+     if (status == ERROR_NOT_FOUND) {
+         status = SIGAR_NO_SUCH_PROCESS;
+     }
+@@ -1507,7 +1526,7 @@ static int sigar_proc_env_parse(UCHAR *ptr, sigar_proc_env_t *procenv,
+             break; /*XXX*/
+         }
+ 
+-        klen = val - ptr;
++        klen = val - (char*)ptr;
+         SIGAR_SSTRCPY(key, ptr);
+         key[klen] = '\0';
+         ++val;
+@@ -1640,6 +1659,7 @@ SIGAR_DECLARE(int) sigar_proc_exe_get(sigar_t *sigar, sigar_pid_t pid,
+     }
+ 
+     status = sigar_proc_exe_peb_get(sigar, proc, procexe);
++#ifdef MSVC
+     if (procexe->name[0] == '\0') {
+         /* likely we are 32-bit, pid process is 64-bit */
+         /* procexe->cwd[0] = XXX where else can we try? */
+@@ -1648,7 +1668,7 @@ SIGAR_DECLARE(int) sigar_proc_exe_get(sigar_t *sigar, sigar_pid_t pid,
+             status = SIGAR_NO_SUCH_PROCESS;
+         }
+     }
+-
++#endif
+     if (procexe->cwd[0] != '\0') {
+         /* strip trailing '\' */
+         int len = strlen(procexe->cwd);
+@@ -2394,10 +2414,10 @@ static int sigar_get_netif_ipaddr(sigar_t *sigar,
+             MIB_IPADDRROW *row = &mib->table[i];
+             short type;
+ 
+-#ifdef SIGAR_USING_MSC6
+-            type = row->unused2;
+-#else
++#if HAVE_MIB_IPADDRROW_WTYPE
+             type = row->wType;
++#else
++            type = row->unused2;
+ #endif
+             if (!(type & MIB_IPADDR_PRIMARY)) {
+                 continue;
+diff --git a/tests/t_sigar_fs.c b/tests/t_sigar_fs.c
+index f298a08..7a554de 100644
+--- a/tests/t_sigar_fs.c
++++ b/tests/t_sigar_fs.c
+@@ -39,7 +39,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <errno.h>
+-#if defined(_WIN32)
++#if defined(MSVC)
+ #include <WinError.h>
+ #endif
+ 
+@@ -85,7 +85,7 @@ TEST(test_sigar_file_system_list_get) {
+ 		} else {
+ 			switch (ret) {
+ 				/* track the expected error code */
+-#if defined(_WIN32)
++#if defined(MSVC)
+ 			case ERROR_NOT_READY:
+ 				break;
+ #endif
+diff --git a/tests/t_sigar_proc.c b/tests/t_sigar_proc.c
+index 88a9ac7..334bae3 100644
+--- a/tests/t_sigar_proc.c
++++ b/tests/t_sigar_proc.c
+@@ -39,7 +39,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <errno.h>
+-#if defined(_WIN32)
++#if defined(MSVC)
+ #include <WinError.h>
+ #endif
+ 
+@@ -127,7 +127,7 @@ TEST(test_sigar_proc_list_get) {
+ 			switch (ret) {
+ 			case EPERM:
+ 			case ESRCH:
+-#if (defined(_WIN32))
++#if (defined(MSVC))
+ 			/* OpenProcess() may return ERROR_ACCESS_DENIED */
+ 			case ERROR_ACCESS_DENIED:
+ #endif
